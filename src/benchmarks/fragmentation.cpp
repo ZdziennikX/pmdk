@@ -46,6 +46,18 @@
 #include "os.h"
 #include "poolset_util.hpp"
 
+ /*
+ * The factor used for PMEM pool size calculation, accounts for metadata,
+ * fragmentation and etc.
+ */
+#define FACTOR 1.2f
+
+ /* The minimum allocation size that pmalloc can perform */
+#define ALLOC_MIN_SIZE 64
+
+ /* OOB and allocation header size */
+#define OOB_HEADER_SIZE 64
+
 /*
  * mem_usage -- specifies how memory will grow
  */
@@ -56,11 +68,23 @@ enum mem_usage_type {
 	MEM_USAGE_RAMP,
 };
 
+struct frag_obj
+{
+	int block_lifetime;
+	size_t block_size;
+	PMEMoid oid;
+	void * ptr;
+};
+
 /*
  * prog_args -- benchmark specific arguments
  */
 struct prog_args {
 	char *mem_usage_type_str; /* mem_usage_type: flat, peak, ramp */
+	size_t min_obj_size;
+	size_t max_obj_size;
+	int nb_memory_blocks;
+	
 	//	size_t fsize; /* requested file size */
 	//	bool no_warmup; /* don't do warmup */
 	//	unsigned seed; /* seed for randomization */
@@ -73,6 +97,8 @@ struct frag_bench
 	PMEMobjpool *pop; /* persistent pool handle */
 	struct prog_args *pa; /* prog_args structure */
 	mem_usage_type mem_usage;
+	frag_obj *frag_objs;
+	uint64_t nobjs;
 };
 
 /*
@@ -92,15 +118,18 @@ parse_memory_usage_type(const char *arg)
 	else
 		return MEM_USAGE_UNKNOWN;
 }
+
+static int op_count = 0;
+
 /*
  * frag_operation -- main operations for fragmentation benchmark
  */
 static int
 frag_operation(struct benchmark *bench, struct operation_info *info)
 {
-	//std::cout << "frag_operation\n";   //to delete
+	std::cout << "frag_operation"<<op_count++<<"\n";   //to delete
 	//auto *fb = (struct frag_bench *)pmembench_get_priv(bench);
-	//auto *bworker = (struct blk_worker *)info->worker->priv;
+	//auto *bworker = (struct frag_worker *)info->worker->priv;
 
 	//os_off_t off = bworker->blocks[info->index];
 	//return bb->worker(bb, info->args, bworker, off);
@@ -115,6 +144,7 @@ frag_init_worker(struct benchmark *bench,
 	struct benchmark_args *args,
 	struct worker_info *worker)
 {
+	//std::cout<<worker->
 	return 0;
 }
 
@@ -142,19 +172,67 @@ frag_init(struct benchmark *bench, struct benchmark_args *args)
 	auto *ba = (struct prog_args *)args->opts;
 	assert(ba != nullptr);
 	
-	auto *ob = (struct frag_bench *)malloc(sizeof(struct frag_bench));
-	if (ob == nullptr) {
+	auto *fb = (struct frag_bench *)malloc(sizeof(struct frag_bench));
+	if (fb == nullptr) {
 		perror("malloc");
 		return -1;
 	}
 	
-	ob->mem_usage = parse_memory_usage_type(ob->pa->mem_usage_type_str);
+	fb->pa = (struct prog_args *)args->opts;
 	
-	//std::cout << ob->pa->test << std::endl;
+	size_t poolsize;
+	size_t n_ops_total = args->n_ops_per_thread * args->n_threads;
+	assert(n_ops_total != 0);
+
+	fb->nobjs = args->n_ops_per_thread * args->n_threads;
+
+	///* Create pmemobj pool. */
+	if (fb->pa->max_obj_size < ALLOC_MIN_SIZE)
+		fb->pa->max_obj_size = ALLOC_MIN_SIZE;
+
+	///* For data objects */
+	poolsize = fb->nobjs * (fb->pa->max_obj_size + OOB_HEADER_SIZE);
+
+	///* multiply by FACTOR for metadata, fragmentation, etc. */
+	poolsize = poolsize * FACTOR;
+
+	if (args->is_poolset || util_file_is_device_dax(args->fname)) {
+		if (args->fsize < poolsize) {
+			fprintf(stderr, "file size too large\n");
+			goto free_fb;
+		}
+		poolsize = 0;
+	}
+	else if (poolsize < PMEMOBJ_MIN_POOL) {
+		poolsize = PMEMOBJ_MIN_POOL;
+	}
+
+	poolsize = PAGE_ALIGNED_UP_SIZE(poolsize);
+
+	fb->pop = pmemobj_create(args->fname, nullptr, poolsize, args->fmode);
+	if (fb->pop == nullptr) {
+		fprintf(stderr, "%s\n", pmemobj_errormsg());
+		goto free_fb;
+	}
 	
-	pmembench_set_priv(bench, ob);
+	fb->mem_usage = parse_memory_usage_type(fb->pa->mem_usage_type_str);
 	
+	fb->frag_objs = (struct frag_obj *)malloc(sizeof(struct frag_obj));
+	if (fb->frag_objs == nullptr)
+	{
+		perror("malloc");
+		goto free_fb;
+	}
+	
+	pmembench_set_priv(bench, fb);
+	
+
+
 	return 0;
+
+free_fb:
+	free(fb);
+	return -1;
 }
 
 /*
@@ -163,27 +241,58 @@ frag_init(struct benchmark *bench, struct benchmark_args *args)
 static int
 frag_exit(struct benchmark *bench, struct benchmark_args *args)
 {
-	auto *ob = (struct obj_bench *)pmembench_get_priv(bench);
+	auto *fb = (struct frag_bench *)pmembench_get_priv(bench);
 	
-	free(ob);
+	pmemobj_close(fb->pop);
+
+	free(fb);
 	return 0;
 }
 
-static struct benchmark_clo frag_clo[1];
+static struct benchmark_clo frag_clo[3];
 static struct benchmark_info test_info;
 
 CONSTRUCTOR(frag_constructor)
 void
 frag_constructor(void)
 {
-	frag_clo[0].opt_long = "memory_usage";
+	frag_clo[0].opt_long = "memory-usage";
 	frag_clo[0].descr = "Tested memory usage pattern";
 	frag_clo[0].type = CLO_TYPE_STR;
 	frag_clo[0].off = 
 		clo_field_offset(struct prog_args, mem_usage_type_str);
 	frag_clo[0].def = "flat";
 	frag_clo[0].ignore_in_res = false;
+	
+	frag_clo[1].opt_long = "min-obj-size";
+	frag_clo[1].descr = "minimum obj size";
+	frag_clo[1].type = CLO_TYPE_UINT;
+	frag_clo[1].off = clo_field_offset(struct prog_args, min_obj_size);
+	frag_clo[1].def = "64";
+	frag_clo[1].type_uint.size = clo_field_size(struct prog_args, min_obj_size);
+	frag_clo[1].type_uint.base = CLO_INT_BASE_DEC;
+	frag_clo[1].type_uint.min = 0;
+	frag_clo[1].type_uint.max = ~0;
 
+	frag_clo[2].opt_long = "max-obj-size";
+	frag_clo[2].descr = "maximum obj size";
+	frag_clo[2].type = CLO_TYPE_UINT;
+	frag_clo[2].off = clo_field_offset(struct prog_args, max_obj_size);
+	frag_clo[2].def = "64";
+	frag_clo[2].type_uint.size = clo_field_size(struct prog_args, max_obj_size);
+	frag_clo[2].type_uint.base = CLO_INT_BASE_DEC;
+	frag_clo[2].type_uint.min = 0;
+	frag_clo[2].type_uint.max = ~0;
+	/*frag_clo[1].opt_long = "nb_frag_objs";
+	frag_clo[1].descr = "Number of memory blocks";
+	frag_clo[1].off = clo_field_offset(struct prog_args, nb_memory_blocks);
+	frag_clo[1].def = "1";
+	frag_clo[1].type = CLO_TYPE_UINT;
+	frag_clo[1].type_uint.size = clo_field_size(struct prog_args, nb_memory_blocks);
+	frag_clo[1].type_uint.base = CLO_INT_BASE_DEC;
+	frag_clo[1].type_uint.min = 1;
+	frag_clo[1].type_uint.max = UINT_MAX;
+	*/
 	test_info.name = "test_frag";
 	test_info.brief = "Benchmark test_frag operation";
 	test_info.init = frag_init; 
