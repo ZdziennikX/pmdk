@@ -80,17 +80,6 @@ struct prog_args {
 	
 };
 
-struct frag_bench
-{
-	PMEMobjpool *pop; /* persistent pool handle */
-	struct prog_args *pa; /* prog_args structure */
-	mem_usage_type mem_usage;
-	uint64_t n_ops;
-	//size_t n
-	size_t poolsize;
-	size_t theoretical_memory_usage;
-};
-
 struct frag_obj
 {
 	int block_lifetime;
@@ -101,22 +90,21 @@ struct frag_obj
 	void init(struct prog_args *args)
 	{
 		block_lifetime = args->lifetime;
-		block_size = 0;//args->start_obj_size;
-		//max_block_size = args->max_obj_size;
+		block_size = args->start_obj_size;
 		is_allocated = false;
-		//growth_factor = 8;
 	}
 };
 
-/*
-* struct frag_worker -- fragmentation worker context
-*/
-struct frag_worker {
+struct frag_bench
+{
+	PMEMobjpool *pop; /* persistent pool handle */
+	struct prog_args *pa; /* prog_args structure */
+	mem_usage_type mem_usage;
+	uint64_t n_ops;
+	size_t poolsize;
+	size_t theoretical_memory_usage;
 	struct frag_obj **pmemobj_array;
-	size_t max_block_size;
-	size_t cur_block_size;
-	size_t growth_factor;
-	void free_worker(int nb)
+	void free_pmemobj_array(int nb)
 	{
 		for (int i = 0; i < nb && nb >= 0; i++)
 		{
@@ -127,6 +115,16 @@ struct frag_worker {
 			free(pmemobj_array[i]);
 		}
 	}
+};
+
+/*
+* struct frag_worker -- fragmentation worker context
+*/
+struct frag_worker {
+	unsigned op_obj_off;
+	size_t max_block_size;
+	size_t cur_block_size;
+	size_t growth_factor;
 };
 
 /*
@@ -170,7 +168,7 @@ frag_operation(struct benchmark *bench, struct operation_info *info)
 {	
 	auto *fb = (struct frag_bench *)pmembench_get_priv(bench);
 	auto *fworker = (struct frag_worker *)info->worker->priv;
-	auto *op_pmemobj = fworker->pmemobj_array[info->index];
+	auto *op_pmemobj = fb->pmemobj_array[fworker->op_obj_off + info->index];
 	
 	op_pmemobj->block_size = fworker->cur_block_size;
 
@@ -178,13 +176,12 @@ frag_operation(struct benchmark *bench, struct operation_info *info)
 		nullptr)) {
 		perror("pmemobj_alloc");
 
-		fworker->free_worker(info->index - 1);
 		free(fworker);
 		return -1;
 	}
 	op_pmemobj->is_allocated = true;
 	fb->theoretical_memory_usage += op_pmemobj->block_size;
-	std::cout << "mem usage 1" << fb->theoretical_memory_usage << std::endl;
+	std::cout << "mem usage 1 from thread "<< info->worker->index <<" " << fb->theoretical_memory_usage << std::endl;
 	switch (fb->mem_usage)
 	{
 	case MEM_USAGE_FLAT:
@@ -207,7 +204,7 @@ frag_operation(struct benchmark *bench, struct operation_info *info)
 	default:
 		break;
 	}
-	std::cout << "mem usage 2 " << fb->theoretical_memory_usage << std::endl;
+	std::cout << "mem usage 2 from thread " << info->worker->index << " " << fb->theoretical_memory_usage << std::endl;
 	return 0;
 }
 
@@ -229,34 +226,12 @@ frag_init_worker(struct benchmark *bench,
 
 	auto *fb = (struct frag_bench *)pmembench_get_priv(bench);
 
-	fworker->pmemobj_array = (struct frag_obj **)malloc(sizeof(struct frag_obj*)*args->n_ops_per_thread);
-	if (fworker->pmemobj_array == nullptr)
-	{
-		perror("malloc");
-		goto free_fworker;
-	}
-	for (unsigned i = 0; i < args->n_ops_per_thread; ++i)
-	{
-		fworker->pmemobj_array[i]= (struct frag_obj *)malloc(sizeof(struct frag_obj));
-
-		if (fworker->pmemobj_array[i] == nullptr)
-		{
-			perror("malloc");
-			fworker->free_worker(i - 1);
-			goto free_fworker;
-		}
-		fworker->pmemobj_array[i]->init(fb->pa);
-	}
-
+	fworker->op_obj_off = worker->index * args->n_ops_per_thread;
 	fworker->cur_block_size = fb->pa->start_obj_size;
 	fworker->max_block_size = fb->pa->max_obj_size;
 	fworker->growth_factor = fb->pa->growth_factor;
 	worker->priv = fworker;
 	return 0;
-
-free_fworker:
-	free(fworker);
-	return -1;
 }
 
 /*
@@ -268,7 +243,6 @@ frag_free_worker(struct benchmark *bench,
 	struct worker_info *worker)
 {
 	auto *fworker = (struct frag_worker *)worker->priv;
-	fworker->free_worker(args->n_ops_per_thread);
 	free(fworker);
 }
 
@@ -328,6 +302,25 @@ frag_init(struct benchmark *bench, struct benchmark_args *args)
 		goto free_fb;
 	}
 	
+	fb->pmemobj_array = (struct frag_obj **)malloc(sizeof(struct frag_obj*) * n_objs);
+	if (fb->pmemobj_array == nullptr)
+	{
+		perror("malloc");
+		goto free_pop;
+	}
+	for (unsigned i = 0; i < n_objs; ++i)
+	{
+		fb->pmemobj_array[i]= (struct frag_obj *)malloc(sizeof(struct frag_obj));
+
+		if (fb->pmemobj_array[i] == nullptr)
+		{
+			perror("malloc");
+			fb->free_pmemobj_array(i - 1);
+			goto free_pop;
+		}
+		fb->pmemobj_array[i]->init(fb->pa);
+	}
+
 	fb->mem_usage = parse_memory_usage_type(fb->pa->mem_usage_type_str);
 	fb->theoretical_memory_usage = 0;
 
@@ -335,6 +328,8 @@ frag_init(struct benchmark *bench, struct benchmark_args *args)
 
 	return 0;
 
+free_pop:
+	pmemobj_close(fb->pop);
 free_fb:
 	free(fb);
 	return -1;
@@ -348,6 +343,9 @@ frag_exit(struct benchmark *bench, struct benchmark_args *args)
 {
 	auto *fb = (struct frag_bench *)pmembench_get_priv(bench);
 
+	//TODO calculate real memory usage
+	fb->free_pmemobj_array(args->n_ops_per_thread *args->n_threads);
+
 	pmemobj_close(fb->pop);
 
 	free(fb);
@@ -358,7 +356,7 @@ frag_print_fragmentation(struct benchmark *bench,
 	struct benchmark_args *args,
 	struct total_results *res)
 {
-	std::cout << ";test\n";
+	std::cout << ";print fragmentation bench result TODO\n";
 }
 
 static struct benchmark_clo frag_clo[5];
