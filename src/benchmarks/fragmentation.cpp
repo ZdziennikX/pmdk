@@ -68,6 +68,9 @@ enum mem_usage_type {
 	MEM_USAGE_RAMP,
 };
 
+static float fragmentation = 0;
+static float fragmentation2 = 0;
+
 /*
  * prog_args -- benchmark specific arguments
  */
@@ -76,13 +79,15 @@ struct prog_args {
 	size_t start_obj_size;
 	size_t max_obj_size;
 	size_t growth_factor;
+	size_t peak_multiplier;
 	unsigned lifetime;
-	
+	unsigned peak_lifetime;
+	unsigned peak_allocs;
 };
 
 struct frag_obj
 {
-	int block_lifetime;
+	unsigned block_lifetime;
 	size_t block_size;
 	PMEMoid oid;
 	bool is_allocated;
@@ -104,9 +109,10 @@ struct frag_bench
 	size_t poolsize;
 	size_t theoretical_memory_usage;
 	struct frag_obj **pmemobj_array;
-	void free_pmemobj_array(int nb)
+
+	void free_pmemobj_array(unsigned nb)
 	{
-		for (int i = 0; i < nb && nb >= 0; i++)
+		for (unsigned i = 0; i < nb && nb >= 0; i++)
 		{
 			if (pmemobj_array[i]->is_allocated)
 			{
@@ -149,7 +155,8 @@ parse_memory_usage_type(const char *arg)
 * dealloc_after_obj_lifetime -- function deallocate memory after object lifetime except last operation
   memory is not deallocated for purpose of fragmentation calculation at the end of benchmark execution
 */
-static void dealloc_after_obj_lifetime(frag_obj * op_obj, int op_index, int n_ops, size_t *mem_usage)
+static void
+dealloc_after_obj_lifetime(frag_obj * op_obj, int op_index, int n_ops, size_t *mem_usage)
 {
 	sleep(op_obj->block_lifetime);
 	if (op_index < n_ops - 1)
@@ -158,6 +165,34 @@ static void dealloc_after_obj_lifetime(frag_obj * op_obj, int op_index, int n_op
 		*mem_usage -= op_obj->block_size;
 		op_obj->is_allocated = false;
 	}
+}
+
+static int
+alloc_peak(frag_bench *fb)
+{
+	std::cout << "peak alloc\n";//todelete
+	PMEMoid *oids;
+	oids = (PMEMoid *)malloc(fb->pa->peak_allocs * sizeof(*oids));
+
+	for (unsigned i = 0; i <fb->pa->peak_allocs; ++i)
+	{
+		if (pmemobj_alloc(fb->pop, &oids[i], ALLOC_MIN_SIZE, 0, nullptr,
+			nullptr)) {
+			perror("pmemobj_alloc");
+			free(oids);
+			return -1;
+		}
+	}
+
+	usleep(fb->pa->peak_lifetime);
+
+	for (unsigned i = 0; i < fb->pa->peak_allocs; ++i)
+	{
+		pmemobj_free(&oids[i]);
+	}
+
+	free(oids);
+	return 0;
 }
 
 /*
@@ -171,17 +206,15 @@ frag_operation(struct benchmark *bench, struct operation_info *info)
 	auto *op_pmemobj = fb->pmemobj_array[fworker->op_obj_off + info->index];
 	
 	op_pmemobj->block_size = fworker->cur_block_size;
-
+	std::cout << "op " << info->index << " thread " << info->worker->index << " block size " << fworker->cur_block_size << std::endl;//todelete
 	if (pmemobj_alloc(fb->pop, &op_pmemobj->oid, op_pmemobj->block_size, 0, nullptr,
 		nullptr)) {
 		perror("pmemobj_alloc");
-
-		free(fworker);
 		return -1;
 	}
 	op_pmemobj->is_allocated = true;
 	fb->theoretical_memory_usage += op_pmemobj->block_size;
-	std::cout << "mem usage 1 from thread "<< info->worker->index <<" " << fb->theoretical_memory_usage << std::endl;
+
 	switch (fb->mem_usage)
 	{
 	case MEM_USAGE_FLAT:
@@ -199,12 +232,16 @@ frag_operation(struct benchmark *bench, struct operation_info *info)
 		}
 		break;
 	case MEM_USAGE_PEAK:
-		//TODO pick allocations
+		if (alloc_peak(fb))
+		{
+			return -1;
+		}
+		dealloc_after_obj_lifetime(op_pmemobj, info->index, fb->n_ops, &fb->theoretical_memory_usage);
 		break;
 	default:
 		break;
 	}
-	std::cout << "mem usage 2 from thread " << info->worker->index << " " << fb->theoretical_memory_usage << std::endl;
+
 	return 0;
 }
 
@@ -216,6 +253,7 @@ frag_init_worker(struct benchmark *bench,
 	struct benchmark_args *args,
 	struct worker_info *worker)
 {
+	std::cout << "init worker " << worker->index << "\n";//todelete
 	struct frag_worker *fworker =
 		(struct frag_worker *)malloc(sizeof(*fworker));
 
@@ -243,6 +281,7 @@ frag_free_worker(struct benchmark *bench,
 	struct worker_info *worker)
 {
 	auto *fworker = (struct frag_worker *)worker->priv;
+	std::cout << "free worker " << worker->index << "\n";//todelete
 	free(fworker);
 }
 
@@ -255,7 +294,7 @@ frag_init(struct benchmark *bench, struct benchmark_args *args)
 	assert(bench != nullptr);
 	assert(args != nullptr);
 	assert(args->opts != nullptr);
-	
+	std::cout << "frag init\n";//todelete
 	auto *fa = (struct prog_args *)args->opts;
 	assert(fa != nullptr);
 	
@@ -278,7 +317,7 @@ frag_init(struct benchmark *bench, struct benchmark_args *args)
 
 	///* For data objects */
 	size_t n_objs = args->n_ops_per_thread * args->n_threads;
-	fb->poolsize = n_objs * (fb->pa->max_obj_size + OOB_HEADER_SIZE);
+	fb->poolsize = n_objs * (fb->pa->max_obj_size * fb->pa->peak_multiplier + OOB_HEADER_SIZE);
 
 	///* multiply by FACTOR for metadata, fragmentation, etc. */
 	fb->poolsize = fb->poolsize * FACTOR;
@@ -325,7 +364,7 @@ frag_init(struct benchmark *bench, struct benchmark_args *args)
 	fb->theoretical_memory_usage = 0;
 
 	pmembench_set_priv(bench, fb);
-
+	fragmentation = 0;
 	return 0;
 
 free_pop:
@@ -342,13 +381,41 @@ static int
 frag_exit(struct benchmark *bench, struct benchmark_args *args)
 {
 	auto *fb = (struct frag_bench *)pmembench_get_priv(bench);
+	std::cout << "frag exit\n";//todelete
 
-	//TODO calculate real memory usage
-	fb->free_pmemobj_array(args->n_ops_per_thread *args->n_threads);
+	unsigned n_ops = args->n_ops_per_thread *args->n_threads;
+	PMEMoid oid;
+	size_t remaining = 0;
+	size_t chunk = 100; /* calc at chunk level */
+	while (pmemobj_alloc(fb->pop, &oid, chunk, 0, NULL, NULL) == 0)
+		remaining += pmemobj_alloc_usable_size(oid) + 16;
+
+	size_t allocated_sum = 0;
+	size_t allocated_sum2 = 0;
+	oid = pmemobj_root(fb->pop, 1);
+	for (size_t n = 0; n < n_ops; ++n) {
+		if (fb->pmemobj_array[n]->is_allocated == false)
+			continue;
+		oid = fb->pmemobj_array[n]->oid;
+		oid.pool_uuid_lo = fb->pmemobj_array[n]->oid.pool_uuid_lo;
+		allocated_sum += pmemobj_alloc_usable_size(oid);// +16;
+		allocated_sum2 += pmemobj_alloc_usable_size(oid) +16;
+	}
+
+	size_t used = fb->poolsize - remaining;
+
+	fragmentation = ((float)used / fb->theoretical_memory_usage) - 1.f;
+	fragmentation2 = ((float)used / allocated_sum) - 1.f;
+	float fragmentation3 = ((float)used / allocated_sum2) - 1.f;
+	std::cout << "fragmentation " << fragmentation << std::endl;//todelete
+	std::cout << "fragmentation2 " << fragmentation2 << std::endl;//todelete
+	std::cout << "fragmentation3 " << fragmentation3 << std::endl;//todelete
+	fb->free_pmemobj_array(n_ops);
 
 	pmemobj_close(fb->pop);
 
 	free(fb);
+	std::cout << "free fb\n";//todelete
 	return 0;
 }
 static void
@@ -356,10 +423,10 @@ frag_print_fragmentation(struct benchmark *bench,
 	struct benchmark_args *args,
 	struct total_results *res)
 {
-	std::cout << ";print fragmentation bench result TODO\n";
+	printf(";%f;%f", fragmentation,fragmentation2);
 }
 
-static struct benchmark_clo frag_clo[5];
+static struct benchmark_clo frag_clo[8];
 static struct benchmark_info test_info;
 
 CONSTRUCTOR(frag_constructor)
@@ -388,7 +455,7 @@ frag_constructor(void)
 	frag_clo[2].descr = "maximum obj size";
 	frag_clo[2].type = CLO_TYPE_UINT;
 	frag_clo[2].off = clo_field_offset(struct prog_args, max_obj_size);
-	frag_clo[2].def = "64";
+	frag_clo[2].def = "1024";
 	frag_clo[2].type_uint.size = clo_field_size(struct prog_args, max_obj_size);
 	frag_clo[2].type_uint.base = CLO_INT_BASE_DEC;
 	frag_clo[2].type_uint.min = 0;
@@ -404,15 +471,45 @@ frag_constructor(void)
 	frag_clo[3].type_uint.min = 0;
 	frag_clo[3].type_uint.max = ~0;
 
-	frag_clo[4].opt_long = "growth-factor";
-	frag_clo[4].descr = "factor how much object should growth";
+	frag_clo[4].opt_long = "peak-lifetime";
+	frag_clo[4].descr = "objects memory peak lifetime in ms";
 	frag_clo[4].type = CLO_TYPE_UINT;
-	frag_clo[4].off = clo_field_offset(struct prog_args, growth_factor);
-	frag_clo[4].def = "8";
-	frag_clo[4].type_uint.size = clo_field_size(struct prog_args, growth_factor);
+	frag_clo[4].off = clo_field_offset(struct prog_args, peak_lifetime);
+	frag_clo[4].def = "10";
+	frag_clo[4].type_uint.size = clo_field_size(struct prog_args, peak_lifetime);
 	frag_clo[4].type_uint.base = CLO_INT_BASE_DEC;
 	frag_clo[4].type_uint.min = 0;
 	frag_clo[4].type_uint.max = ~0;
+
+	frag_clo[5].opt_long = "growth-factor";
+	frag_clo[5].descr = "factor how much object should growth";
+	frag_clo[5].type = CLO_TYPE_UINT;
+	frag_clo[5].off = clo_field_offset(struct prog_args, growth_factor);
+	frag_clo[5].def = "8";
+	frag_clo[5].type_uint.size = clo_field_size(struct prog_args, growth_factor);
+	frag_clo[5].type_uint.base = CLO_INT_BASE_DEC;
+	frag_clo[5].type_uint.min = 0;
+	frag_clo[5].type_uint.max = ~0;
+
+	frag_clo[6].opt_long = "peak-multiplier";
+	frag_clo[6].descr = "multiplier for peak memory usage growth";
+	frag_clo[6].type = CLO_TYPE_UINT;
+	frag_clo[6].off = clo_field_offset(struct prog_args, peak_multiplier);
+	frag_clo[6].def = "10";
+	frag_clo[6].type_uint.size = clo_field_size(struct prog_args, peak_multiplier);
+	frag_clo[6].type_uint.base = CLO_INT_BASE_DEC;
+	frag_clo[6].type_uint.min = 0;
+	frag_clo[6].type_uint.max = ~0;
+
+	frag_clo[7].opt_long = "peak-allocs";
+	frag_clo[7].descr = "number of small allocations on peak operation";
+	frag_clo[7].type = CLO_TYPE_UINT;
+	frag_clo[7].off = clo_field_offset(struct prog_args, peak_allocs);
+	frag_clo[7].def = "100";
+	frag_clo[7].type_uint.size = clo_field_size(struct prog_args, peak_allocs);
+	frag_clo[7].type_uint.base = CLO_INT_BASE_DEC;
+	frag_clo[7].type_uint.min = 0;
+	frag_clo[7].type_uint.max = ~0;
 
 	test_info.name = "test_frag";
 	test_info.brief = "Benchmark test_frag operation";
