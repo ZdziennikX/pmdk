@@ -83,7 +83,7 @@ struct prog_args {
 	size_t max_obj_size;
 	size_t growth_factor;
 	size_t peak_multiplier;
-	unsigned lifetime;
+	unsigned operation_time;
 	unsigned peak_lifetime;
 	unsigned peak_allocs;
 };
@@ -94,12 +94,14 @@ struct frag_obj
 	size_t block_size;
 	PMEMoid oid;
 	bool is_allocated;
+	int op_index;
 
 	void init(struct prog_args *args)
 	{
-		block_lifetime = args->lifetime;
+		block_lifetime = args->operation_time;
 		block_size = args->start_obj_size;
 		is_allocated = false;
+		op_index = -1;
 	}
 };
 
@@ -112,8 +114,7 @@ struct frag_bench
 	size_t poolsize;
 	size_t theoretical_memory_usage;
 	struct frag_obj **pmemobj_array;
-	int(*func_op)(frag_obj * op_obj, frag_bench * fb, struct frag_worker * fworker, operation_info *info);
-	benchmark_worker *local_worker;
+	int(*func_op)(frag_obj * op_obj, frag_bench * fb, struct frag_worker * fworker, operation_info *info);//info to delete
 
 	void free_pmemobj_array(unsigned nb)
 	{
@@ -128,6 +129,15 @@ struct frag_bench
 	}
 };
 
+struct action_obj {
+	PMEMoid *peak_oids = nullptr;
+	bool peak_allocated = false;
+	unsigned allocation_start_time = 0;
+	unsigned deallocation_time = 0;
+	unsigned next_action_time = 0;
+	int(*action_op)(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker) = nullptr;
+};
+
 /*
 * struct frag_worker -- fragmentation worker context
 */
@@ -136,6 +146,7 @@ struct frag_worker {
 	size_t max_block_size;
 	size_t cur_block_size;
 	size_t growth_factor;
+	unsigned current_test_time;
 };
 
 struct scenario {
@@ -161,15 +172,31 @@ parse_memory_usage_type(const char *arg)
 		return MEM_USAGE_UNKNOWN;
 }
 
+static int
+alloc_obj(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker)
+{
+	std::cout << "alloc_obj op index" << op_obj->op_index << std::endl;
+	if (pmemobj_alloc(fb->pop, &op_obj->oid, op_obj->block_size, 0, nullptr,
+		nullptr)) {
+		perror("pmemobj_alloc");
+		return -1;
+	}
+	op_obj->is_allocated = true;
+	//op_obj->deallocation_time = worker->current_test_time + obj_lifetime;
+	fb->theoretical_memory_usage += op_obj->block_size;
+	return 0;
+}
 /*
-* dealloc_obj -- function deallocate memory after object lifetime except last operation
-memory is not deallocated for purpose of fragmentation calculation at the end of benchmark execution
+* dealloc_obj -- function deallocate memory except last operation.
+  Memory is not deallocated for purpose of fragmentation calculation
+  at the end of benchmark execution
 */
 static void
-dealloc_obj(frag_obj * op_obj, int op_index, int n_ops, size_t *mem_usage)
+dealloc_obj(frag_obj * op_obj, int n_ops, size_t *mem_usage)
 {
+	std::cout << "dealloc_obj op index" << op_obj->op_index << std::endl;
 	//sleep(op_obj->block_lifetime);
-	if (op_index < n_ops - 1)
+	if (op_obj->op_index < n_ops - 1)
 	{
 		pmemobj_free(&op_obj->oid);
 		*mem_usage -= op_obj->block_size;
@@ -178,23 +205,38 @@ dealloc_obj(frag_obj * op_obj, int op_index, int n_ops, size_t *mem_usage)
 }
 
 static int
+alloc_obj_if_not_allocated(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker)
+{
+	std::cout << "alloc_obj_if_not_allocated op index" << op_obj->op_index << std::endl;
+	if (!op_obj->is_allocated)
+	{
+		alloc_obj(op_obj, fb, worker);
+	}
+	return 0;
+}
+
+static PMEMoid *
 alloc_peak(frag_bench *fb)
 {
 	std::cout << "peak alloc\n";//todelete
-	PMEMoid *oids;
-	oids = (PMEMoid *)malloc(fb->pa->peak_allocs * sizeof(*oids));
-
+	PMEMoid *oids = (PMEMoid *)malloc(fb->pa->peak_allocs * sizeof(*oids));
+	
 	for (unsigned i = 0; i <fb->pa->peak_allocs; ++i)
 	{
 		if (pmemobj_alloc(fb->pop, &oids[i], ALLOC_MIN_SIZE, 0, nullptr,
 			nullptr)) {
 			perror("pmemobj_alloc");
 			free(oids);
-			return -1;
+			return nullptr;
 		}
 	}
+	return oids;
+}
 
-	//usleep(fb->pa->peak_lifetime);
+static int
+dealloc_peak(frag_bench *fb, PMEMoid *oids)
+{
+	std::cout << "peak dealloc\n";//todelete
 
 	for (unsigned i = 0; i < fb->pa->peak_allocs; ++i)
 	{
@@ -206,59 +248,138 @@ alloc_peak(frag_bench *fb)
 }
 
 static int
-test_allocations(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, operation_info *info, mem_usage_type mem_usage)
+alloc_greater_obj(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker)
 {
-	if (pmemobj_alloc(fb->pop, &op_obj->oid, op_obj->block_size, 0, nullptr,
-		nullptr)) {
-		perror("pmemobj_alloc");
-		return -1;
-	}
-	op_obj->is_allocated = true;
-	fb->theoretical_memory_usage += op_obj->block_size;
-
-	switch (mem_usage)
+	std::cout << "alloc_greater_obj op index" << op_obj->op_index << std::endl;
+	if(op_obj->is_allocated)
+		dealloc_obj(op_obj, fb->n_ops, &fb->theoretical_memory_usage);
+	if (worker->cur_block_size < worker->max_block_size)
 	{
-	case MEM_USAGE_FLAT:
-		dealloc_obj(op_obj, info->index, fb->n_ops, &fb->theoretical_memory_usage);
-		break;
-	case MEM_USAGE_RAMP:
-		dealloc_obj(op_obj, info->index, fb->n_ops, &fb->theoretical_memory_usage);
-		if (worker->cur_block_size < worker->max_block_size)
+		worker->cur_block_size += worker->growth_factor;
+		if (worker->cur_block_size > worker->max_block_size)
 		{
-			worker->cur_block_size += worker->growth_factor;
-			if (worker->cur_block_size > worker->max_block_size)
+			worker->cur_block_size = worker->max_block_size;
+		}
+	}
+	op_obj->block_size = worker->cur_block_size;
+	return alloc_obj(op_obj, fb, worker);
+}
+
+static int
+background_operation(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, action_obj * action)
+{
+	unsigned current_time = worker->current_test_time;
+	if (current_time == action->next_action_time)
+	{
+		if (action->next_action_time != action->deallocation_time)
+		{
+			std::cout << "action before dealloc" << worker->current_test_time << std::endl;
+			switch (fb->background_mem_usage)
 			{
-				worker->cur_block_size = worker->max_block_size;
+			case MEM_USAGE_FLAT:
+				break;
+			case MEM_USAGE_RAMP:
+				if (alloc_greater_obj(op_obj, fb, worker))
+					return -1;
+				action->next_action_time = current_time + fb->pa->peak_lifetime;
+
+				break;
+			case MEM_USAGE_PEAK:
+				if (action->peak_allocated)
+				{
+					dealloc_peak(fb, action->peak_oids);
+					action->next_action_time = action->deallocation_time;
+				}
+				else
+				{
+					action->peak_oids = alloc_peak(fb);
+					if (action->peak_oids == nullptr)
+						return -1;
+					action->peak_allocated = true;
+					action->next_action_time = current_time + fb->pa->peak_lifetime;
+				}
+				break;
+			default:
+				break;
+			}
+
+			if (action->next_action_time > action->deallocation_time)
+			{
+				action->next_action_time = action->deallocation_time;
 			}
 		}
+		else
+		{
+			dealloc_obj(op_obj, fb->n_ops, &fb->theoretical_memory_usage);
+		}
+	}
+	return 0;
+}
+
+static void
+init_basic_action(frag_bench * fb, struct frag_worker * worker, action_obj * action, mem_usage_type mem_usage_type)
+{
+	switch (mem_usage_type)
+	{
+	case MEM_USAGE_FLAT:
+		action->action_op = alloc_obj_if_not_allocated;
+		action->allocation_start_time = 0;
+		action->deallocation_time = fb->pa->operation_time;
+		action->next_action_time = action->deallocation_time;
+		break;
+	case MEM_USAGE_RAMP:
+		action->action_op = alloc_greater_obj;
+		action->allocation_start_time = 0;
+		action->deallocation_time = fb->pa->operation_time;
+		action->next_action_time = action->deallocation_time;//czas po jakim obiekt sie powieksza
 		break;
 	case MEM_USAGE_PEAK:
-		if (alloc_peak(fb))
-		{
-			return -1;
-		}
-		dealloc_obj(op_obj, info->index, fb->n_ops, &fb->theoretical_memory_usage);
+		action->action_op = alloc_obj_if_not_allocated;
+		action->allocation_start_time = 0;
+		action->deallocation_time = fb->pa->operation_time;
+		action->next_action_time = worker->current_test_time + fb->pa->peak_lifetime;//czas po jakim obiekt sie powieksza
 		break;
 	default:
 		break;
 	}
-
-	return 0;
 }
 
 static int
-basic(frag_obj * op_obj, frag_bench * fb, struct frag_worker * fworker, operation_info *info)
+basic(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, operation_info *info)//info to delete
 {
-	return test_allocations(op_obj, fb, fworker, info, fb->background_mem_usage);
-}
+	std::cout << "basic " << info->index << " worker " << info->worker->index << std::endl;
+	auto *action = (struct action_obj *)malloc(sizeof(struct action_obj));
 
-static int
-add_peaks(frag_obj * op_obj, frag_bench * fb, struct frag_worker * fworker, operation_info *info)
-{
-	//struct fragmentatnion_worker *fworker = fragmentatnion_worker_alloc();
-	if (test_allocations(op_obj, fb, fworker, info, MEM_USAGE_PEAK))
+	init_basic_action(fb, worker, action, fb->background_mem_usage);
+
+	if (action->action_op(op_obj, fb, worker))
 		return -1;
 
+	while (worker->current_test_time<fb->pa->operation_time)
+	{
+		if (background_operation(op_obj, fb, worker, action))
+			return -1;
+		worker->current_test_time++;
+		usleep(1);
+	}
+
+	return 0;
+
+	//return test_allocations(op_obj, fb, fworker, info, fb->background_mem_usage);
+}
+
+static int
+add_peaks(frag_obj * op_obj, frag_bench * fb, struct frag_worker * fworker, operation_info *info)//info to delete
+{
+	PMEMoid *peak_oids = nullptr;
+	int time = 0;
+	alloc_obj(op_obj, fb, fworker);
+	alloc_peak(fb);
+	time++;
+	usleep(1);
+	dealloc_peak(fb, peak_oids);
+	dealloc_obj(op_obj, fb->n_ops, &fb->theoretical_memory_usage);
+	alloc_greater_obj(op_obj, fb, fworker);
 	return 0;
 }
 static struct scenario scenarios[] = {
@@ -289,6 +410,9 @@ frag_operation(struct benchmark *bench, struct operation_info *info)
 	auto *op_pmemobj = fb->pmemobj_array[fworker->op_obj_off + info->index];
 
 	op_pmemobj->block_size = fworker->cur_block_size;
+	op_pmemobj->op_index = fworker->op_obj_off + info->index;
+	fworker->current_test_time = 0;
+
 	std::cout << "op " << info->index << " thread " << info->worker->index << " block size " << fworker->cur_block_size << std::endl;//todelete
 
 	return fb->func_op(op_pmemobj, fb, fworker, info);
@@ -317,6 +441,7 @@ frag_init_worker(struct benchmark *bench,
 	fworker->cur_block_size = fb->pa->start_obj_size;
 	fworker->max_block_size = fb->pa->max_obj_size;
 	fworker->growth_factor = fb->pa->growth_factor;
+	fworker->current_test_time = 0;
 	worker->priv = fworker;
 	return 0;
 }
@@ -517,12 +642,12 @@ frag_constructor(void)
 	frag_clo[2].type_uint.min = 0;
 	frag_clo[2].type_uint.max = ~0;
 
-	frag_clo[3].opt_long = "lifetime";
-	frag_clo[3].descr = "objects lifetime in ms";
+	frag_clo[3].opt_long = "operation_time";//testtime
+	frag_clo[3].descr = "lifetime of object used in operation";
 	frag_clo[3].type = CLO_TYPE_UINT;
-	frag_clo[3].off = clo_field_offset(struct prog_args, lifetime);
+	frag_clo[3].off = clo_field_offset(struct prog_args, operation_time);
 	frag_clo[3].def = "1000";
-	frag_clo[3].type_uint.size = clo_field_size(struct prog_args, lifetime);
+	frag_clo[3].type_uint.size = clo_field_size(struct prog_args, operation_time);
 	frag_clo[3].type_uint.base = CLO_INT_BASE_DEC;
 	frag_clo[3].type_uint.min = 0;
 	frag_clo[3].type_uint.max = ~0;
