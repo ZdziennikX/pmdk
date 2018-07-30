@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2018, Intel Corporation
+ * Copyright 2018, Intel Corporation
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -41,6 +41,7 @@
 #include <iostream>//to delete
 
 #include "benchmark.hpp"
+//#include "fragmentation_worker.hpp"
 #include "file.h"
 #include "libpmemobj.h"
 #include "os.h"
@@ -65,7 +66,7 @@ enum mem_usage_type {
 	MEM_USAGE_UNKNOWN,
 	MEM_USAGE_FLAT,
 	MEM_USAGE_PEAK,
-	MEM_USAGE_RAMP,
+	MEM_USAGE_RAMP
 };
 
 static float fragmentation = 0;
@@ -75,7 +76,8 @@ static float fragmentation2 = 0;
  * prog_args -- benchmark specific arguments
  */
 struct prog_args {
-	char *mem_usage_type_str; /* mem_usage_type: flat, peak, ramp */
+	char *background_mem_usage_type_str; /* mem_usage_type: flat, peak, ramp */
+	char *scenario;
 	size_t start_obj_size;
 	size_t max_obj_size;
 	size_t growth_factor;
@@ -104,11 +106,12 @@ struct frag_bench
 {
 	PMEMobjpool *pop; /* persistent pool handle */
 	struct prog_args *pa; /* prog_args structure */
-	mem_usage_type mem_usage;
+	mem_usage_type background_mem_usage;
 	uint64_t n_ops;
 	size_t poolsize;
 	size_t theoretical_memory_usage;
 	struct frag_obj **pmemobj_array;
+	int(*func_op)(frag_obj * op_obj, frag_bench * fb, struct frag_worker * fworker, operation_info *info);
 
 	void free_pmemobj_array(unsigned nb)
 	{
@@ -133,6 +136,11 @@ struct frag_worker {
 	size_t growth_factor;
 };
 
+struct scenario {
+	const char *scenario_name;
+	int(*func_op)(frag_obj * op_obj, frag_bench * fb, struct frag_worker * fworker, operation_info *info);
+};
+
 /*
  * parse_memory_usage_type -- parse command line "--operation" argument
  *
@@ -153,7 +161,7 @@ parse_memory_usage_type(const char *arg)
 
 /*
 * dealloc_after_obj_lifetime -- function deallocate memory after object lifetime except last operation
-  memory is not deallocated for purpose of fragmentation calculation at the end of benchmark execution
+memory is not deallocated for purpose of fragmentation calculation at the end of benchmark execution
 */
 static void
 dealloc_after_obj_lifetime(frag_obj * op_obj, int op_index, int n_ops, size_t *mem_usage)
@@ -195,39 +203,30 @@ alloc_peak(frag_bench *fb)
 	return 0;
 }
 
-/*
- * frag_operation -- main operations for fragmentation benchmark
- */
 static int
-frag_operation(struct benchmark *bench, struct operation_info *info)
-{	
-	auto *fb = (struct frag_bench *)pmembench_get_priv(bench);
-	auto *fworker = (struct frag_worker *)info->worker->priv;
-	auto *op_pmemobj = fb->pmemobj_array[fworker->op_obj_off + info->index];
-	
-	op_pmemobj->block_size = fworker->cur_block_size;
-	std::cout << "op " << info->index << " thread " << info->worker->index << " block size " << fworker->cur_block_size << std::endl;//todelete
-	if (pmemobj_alloc(fb->pop, &op_pmemobj->oid, op_pmemobj->block_size, 0, nullptr,
+background_allocations(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, operation_info *info)
+{
+	if (pmemobj_alloc(fb->pop, &op_obj->oid, op_obj->block_size, 0, nullptr,
 		nullptr)) {
 		perror("pmemobj_alloc");
 		return -1;
 	}
-	op_pmemobj->is_allocated = true;
-	fb->theoretical_memory_usage += op_pmemobj->block_size;
+	op_obj->is_allocated = true;
+	fb->theoretical_memory_usage += op_obj->block_size;
 
-	switch (fb->mem_usage)
+	switch (fb->background_mem_usage)
 	{
 	case MEM_USAGE_FLAT:
-		dealloc_after_obj_lifetime(op_pmemobj, info->index, fb->n_ops, &fb->theoretical_memory_usage);
+		dealloc_after_obj_lifetime(op_obj, info->index, fb->n_ops, &fb->theoretical_memory_usage);
 		break;
 	case MEM_USAGE_RAMP:
-		dealloc_after_obj_lifetime(op_pmemobj, info->index, fb->n_ops, &fb->theoretical_memory_usage);
-		if (fworker->cur_block_size < fworker->max_block_size)
+		dealloc_after_obj_lifetime(op_obj, info->index, fb->n_ops, &fb->theoretical_memory_usage);
+		if (worker->cur_block_size < worker->max_block_size)
 		{
-			fworker->cur_block_size += fworker->growth_factor;
-			if (fworker->cur_block_size > fworker->max_block_size)
+			worker->cur_block_size += worker->growth_factor;
+			if (worker->cur_block_size > worker->max_block_size)
 			{
-				fworker->cur_block_size = fworker->max_block_size;
+				worker->cur_block_size = worker->max_block_size;
 			}
 		}
 		break;
@@ -236,13 +235,61 @@ frag_operation(struct benchmark *bench, struct operation_info *info)
 		{
 			return -1;
 		}
-		dealloc_after_obj_lifetime(op_pmemobj, info->index, fb->n_ops, &fb->theoretical_memory_usage);
+		dealloc_after_obj_lifetime(op_obj, info->index, fb->n_ops, &fb->theoretical_memory_usage);
 		break;
 	default:
 		break;
 	}
 
 	return 0;
+}
+
+static int
+basic(frag_obj * op_obj, frag_bench * fb, struct frag_worker * fworker, operation_info *info)
+{
+	return background_allocations(op_obj, fb, fworker, info);
+}
+
+static int
+add_peaks(frag_obj * op_obj, frag_bench * fb, struct frag_worker * fworker, operation_info *info)
+{
+	//struct fragmentatnion_worker *fworker = fragmentatnion_worker_alloc();
+	if (background_allocations(op_obj, fb, fworker, info))
+		return -1;
+
+	return 0;
+}
+static struct scenario scenarios[] = {
+	{ "basic", basic },
+	{ "basic_with_peaks", add_peaks }
+};
+
+#define SCENARIOS (sizeof(scenarios) / sizeof(scenarios[0]))
+
+static int
+parse_scenario(const char *arg)
+{
+	for (unsigned i = 0; i < SCENARIOS; i++) {
+		if (strcmp(arg, scenarios[i].scenario_name) == 0)
+			return i;
+	}
+	return -1;
+}
+
+/*
+ * frag_operation -- main operations for fragmentation benchmark
+ */
+static int
+frag_operation(struct benchmark *bench, struct operation_info *info)
+{
+	auto *fb = (struct frag_bench *)pmembench_get_priv(bench);
+	auto *fworker = (struct frag_worker *)info->worker->priv;
+	auto *op_pmemobj = fb->pmemobj_array[fworker->op_obj_off + info->index];
+
+	op_pmemobj->block_size = fworker->cur_block_size;
+	std::cout << "op " << info->index << " thread " << info->worker->index << " block size " << fworker->cur_block_size << std::endl;//todelete
+
+	return fb->func_op(op_pmemobj, fb, fworker, info);
 }
 
 /*
@@ -295,6 +342,7 @@ frag_init(struct benchmark *bench, struct benchmark_args *args)
 	assert(args != nullptr);
 	assert(args->opts != nullptr);
 	std::cout << "frag init\n";//todelete
+	int scenario_index;
 	auto *fa = (struct prog_args *)args->opts;
 	assert(fa != nullptr);
 	
@@ -360,7 +408,13 @@ frag_init(struct benchmark *bench, struct benchmark_args *args)
 		fb->pmemobj_array[i]->init(fb->pa);
 	}
 
-	fb->mem_usage = parse_memory_usage_type(fb->pa->mem_usage_type_str);
+	fb->background_mem_usage = parse_memory_usage_type(fb->pa->background_mem_usage_type_str);
+	scenario_index = parse_scenario(fb->pa->scenario);
+	if (scenario_index == -1) {
+		perror("wrong scenario name");
+		goto free_pop;
+	}
+	fb->func_op = scenarios[scenario_index].func_op;
 	fb->theoretical_memory_usage = 0;
 
 	pmembench_set_priv(bench, fb);
@@ -426,18 +480,18 @@ frag_print_fragmentation(struct benchmark *bench,
 	printf(";%f;%f", fragmentation,fragmentation2);
 }
 
-static struct benchmark_clo frag_clo[8];
+static struct benchmark_clo frag_clo[9];
 static struct benchmark_info test_info;
 
 CONSTRUCTOR(frag_constructor)
 void
 frag_constructor(void)
 {
-	frag_clo[0].opt_long = "memory-usage";
+	frag_clo[0].opt_long = "background-memory-usage";
 	frag_clo[0].descr = "Tested memory usage pattern";
 	frag_clo[0].type = CLO_TYPE_STR;
 	frag_clo[0].off = 
-		clo_field_offset(struct prog_args, mem_usage_type_str);
+		clo_field_offset(struct prog_args, background_mem_usage_type_str);
 	frag_clo[0].def = "flat";
 	frag_clo[0].ignore_in_res = false;
 	
@@ -510,6 +564,12 @@ frag_constructor(void)
 	frag_clo[7].type_uint.base = CLO_INT_BASE_DEC;
 	frag_clo[7].type_uint.min = 0;
 	frag_clo[7].type_uint.max = ~0;
+
+	frag_clo[8].opt_long = "scenario";
+	frag_clo[8].descr = "test scenario";
+	frag_clo[8].type = CLO_TYPE_STR;
+	frag_clo[8].off = clo_field_offset(struct prog_args, scenario);
+	frag_clo[8].def = "basic";
 
 	test_info.name = "test_frag";
 	test_info.brief = "Benchmark test_frag operation";
