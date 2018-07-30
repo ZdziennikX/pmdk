@@ -41,6 +41,7 @@
 #include <iostream>//to delete
 
 #include "benchmark.hpp"
+#include "benchmark_worker.hpp"
 //#include "fragmentation_worker.hpp"
 #include "file.h"
 #include "libpmemobj.h"
@@ -112,6 +113,7 @@ struct frag_bench
 	size_t theoretical_memory_usage;
 	struct frag_obj **pmemobj_array;
 	int(*func_op)(frag_obj * op_obj, frag_bench * fb, struct frag_worker * fworker, operation_info *info);
+	benchmark_worker *local_worker;
 
 	void free_pmemobj_array(unsigned nb)
 	{
@@ -160,13 +162,13 @@ parse_memory_usage_type(const char *arg)
 }
 
 /*
-* dealloc_after_obj_lifetime -- function deallocate memory after object lifetime except last operation
+* dealloc_obj -- function deallocate memory after object lifetime except last operation
 memory is not deallocated for purpose of fragmentation calculation at the end of benchmark execution
 */
 static void
-dealloc_after_obj_lifetime(frag_obj * op_obj, int op_index, int n_ops, size_t *mem_usage)
+dealloc_obj(frag_obj * op_obj, int op_index, int n_ops, size_t *mem_usage)
 {
-	sleep(op_obj->block_lifetime);
+	//sleep(op_obj->block_lifetime);
 	if (op_index < n_ops - 1)
 	{
 		pmemobj_free(&op_obj->oid);
@@ -192,7 +194,7 @@ alloc_peak(frag_bench *fb)
 		}
 	}
 
-	usleep(fb->pa->peak_lifetime);
+	//usleep(fb->pa->peak_lifetime);
 
 	for (unsigned i = 0; i < fb->pa->peak_allocs; ++i)
 	{
@@ -204,7 +206,7 @@ alloc_peak(frag_bench *fb)
 }
 
 static int
-background_allocations(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, operation_info *info)
+test_allocations(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, operation_info *info, mem_usage_type mem_usage)
 {
 	if (pmemobj_alloc(fb->pop, &op_obj->oid, op_obj->block_size, 0, nullptr,
 		nullptr)) {
@@ -214,13 +216,13 @@ background_allocations(frag_obj * op_obj, frag_bench * fb, struct frag_worker * 
 	op_obj->is_allocated = true;
 	fb->theoretical_memory_usage += op_obj->block_size;
 
-	switch (fb->background_mem_usage)
+	switch (mem_usage)
 	{
 	case MEM_USAGE_FLAT:
-		dealloc_after_obj_lifetime(op_obj, info->index, fb->n_ops, &fb->theoretical_memory_usage);
+		dealloc_obj(op_obj, info->index, fb->n_ops, &fb->theoretical_memory_usage);
 		break;
 	case MEM_USAGE_RAMP:
-		dealloc_after_obj_lifetime(op_obj, info->index, fb->n_ops, &fb->theoretical_memory_usage);
+		dealloc_obj(op_obj, info->index, fb->n_ops, &fb->theoretical_memory_usage);
 		if (worker->cur_block_size < worker->max_block_size)
 		{
 			worker->cur_block_size += worker->growth_factor;
@@ -235,7 +237,7 @@ background_allocations(frag_obj * op_obj, frag_bench * fb, struct frag_worker * 
 		{
 			return -1;
 		}
-		dealloc_after_obj_lifetime(op_obj, info->index, fb->n_ops, &fb->theoretical_memory_usage);
+		dealloc_obj(op_obj, info->index, fb->n_ops, &fb->theoretical_memory_usage);
 		break;
 	default:
 		break;
@@ -247,14 +249,14 @@ background_allocations(frag_obj * op_obj, frag_bench * fb, struct frag_worker * 
 static int
 basic(frag_obj * op_obj, frag_bench * fb, struct frag_worker * fworker, operation_info *info)
 {
-	return background_allocations(op_obj, fb, fworker, info);
+	return test_allocations(op_obj, fb, fworker, info, fb->background_mem_usage);
 }
 
 static int
 add_peaks(frag_obj * op_obj, frag_bench * fb, struct frag_worker * fworker, operation_info *info)
 {
 	//struct fragmentatnion_worker *fworker = fragmentatnion_worker_alloc();
-	if (background_allocations(op_obj, fb, fworker, info))
+	if (test_allocations(op_obj, fb, fworker, info, MEM_USAGE_PEAK))
 		return -1;
 
 	return 0;
@@ -516,10 +518,10 @@ frag_constructor(void)
 	frag_clo[2].type_uint.max = ~0;
 
 	frag_clo[3].opt_long = "lifetime";
-	frag_clo[3].descr = "objects lifetime in s";
+	frag_clo[3].descr = "objects lifetime in ms";
 	frag_clo[3].type = CLO_TYPE_UINT;
 	frag_clo[3].off = clo_field_offset(struct prog_args, lifetime);
-	frag_clo[3].def = "1";
+	frag_clo[3].def = "1000";
 	frag_clo[3].type_uint.size = clo_field_size(struct prog_args, lifetime);
 	frag_clo[3].type_uint.base = CLO_INT_BASE_DEC;
 	frag_clo[3].type_uint.min = 0;
