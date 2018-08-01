@@ -264,7 +264,25 @@ alloc_greater_obj(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worke
 	op_obj->block_size = worker->cur_block_size;
 	return alloc_obj(op_obj, fb, worker);
 }
-
+static int
+peak_action(frag_bench * fb, action_obj * action, int current_time)
+{
+	if (action->peak_allocated)
+	{
+		dealloc_peak(fb, action->peak_oids);
+		action->peak_allocated = false;
+		action->next_action_time = action->deallocation_time;
+	}
+	else
+	{
+		action->peak_oids = alloc_peak(fb);
+		if (action->peak_oids == nullptr)
+			return -1;
+		action->peak_allocated = true;
+		action->next_action_time = current_time + fb->pa->peak_lifetime;
+	}
+	return 0;
+}
 static int
 background_operation(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, action_obj * action)
 {
@@ -285,19 +303,8 @@ background_operation(frag_obj * op_obj, frag_bench * fb, struct frag_worker * wo
 
 				break;
 			case MEM_USAGE_PEAK:
-				if (action->peak_allocated)
-				{
-					dealloc_peak(fb, action->peak_oids);
-					action->next_action_time = action->deallocation_time;
-				}
-				else
-				{
-					action->peak_oids = alloc_peak(fb);
-					if (action->peak_oids == nullptr)
-						return -1;
-					action->peak_allocated = true;
-					action->next_action_time = current_time + fb->pa->peak_lifetime;
-				}
+				std::cout << "background " << current_time << std::endl;
+				peak_action(fb, action, current_time);
 				break;
 			default:
 				break;
@@ -353,34 +360,70 @@ basic(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, operation
 	init_basic_action(fb, worker, action, fb->background_mem_usage);
 
 	if (action->action_op(op_obj, fb, worker))
-		return -1;
+		goto err ;
 
 	while (worker->current_test_time<fb->pa->operation_time)
 	{
 		if (background_operation(op_obj, fb, worker, action))
-			return -1;
+			goto err;
 		worker->current_test_time++;
 		usleep(1);
 	}
-
+	free(action);
 	return 0;
-
+err:
+	free(action);
+	return -1;
 	//return test_allocations(op_obj, fb, fworker, info, fb->background_mem_usage);
 }
 
 static int
-add_peaks(frag_obj * op_obj, frag_bench * fb, struct frag_worker * fworker, operation_info *info)//info to delete
+add_peaks(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, operation_info *info)//info to delete
 {
-	PMEMoid *peak_oids = nullptr;
-	int time = 0;
-	alloc_obj(op_obj, fb, fworker);
-	alloc_peak(fb);
-	time++;
-	usleep(1);
-	dealloc_peak(fb, peak_oids);
-	dealloc_obj(op_obj, fb->n_ops, &fb->theoretical_memory_usage);
-	alloc_greater_obj(op_obj, fb, fworker);
+	auto *basic_action = (struct action_obj *)malloc(sizeof(struct action_obj));
+	if (basic_action == nullptr)
+	{
+		perror("malloc");
+		return -1;
+	}
+	auto *additional_peak = (struct action_obj *)malloc(sizeof(struct action_obj));
+	if (additional_peak == nullptr)
+	{
+		free(basic_action);
+		perror("malloc");
+		return -1;
+	}
+
+	init_basic_action(fb, worker, basic_action, fb->background_mem_usage);
+	additional_peak->allocation_start_time = basic_action->next_action_time;
+	additional_peak->next_action_time = basic_action->next_action_time;
+	additional_peak->deallocation_time = basic_action->deallocation_time;
+
+	if (basic_action->action_op(op_obj, fb, worker))
+		goto err;
+
+	while (worker->current_test_time<fb->pa->operation_time)
+	{
+		if (background_operation(op_obj, fb, worker, basic_action))
+			goto err;
+
+		if (worker->current_test_time == additional_peak->next_action_time)
+		{
+			std::cout << "additional peak " << worker->current_test_time << std::endl;;
+			peak_action(fb, additional_peak, worker->current_test_time);
+			if (!additional_peak->peak_allocated)
+				additional_peak->next_action_time = basic_action->next_action_time;
+		}
+		worker->current_test_time++;
+		usleep(1);
+	}
+	free(basic_action);
+	free(additional_peak);
 	return 0;
+err:
+	free(basic_action);
+	free(additional_peak);
+	return -1;
 }
 static struct scenario scenarios[] = {
 	{ "basic", basic },
