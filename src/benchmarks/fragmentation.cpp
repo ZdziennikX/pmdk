@@ -469,6 +469,7 @@ add_peaks(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, opera
 		perror("malloc");
 		return -1;
 	}
+
 	auto *additional_peak = (struct action_obj *)malloc(sizeof(struct action_obj));
 	if (additional_peak == nullptr)
 	{
@@ -479,6 +480,7 @@ add_peaks(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, opera
 
 	if (init_basic_action(fb, worker, basic_action, fb->background_mem_usage))
 		goto err;
+
 	additional_peak->allocation_start_time = basic_action->next_action_time;
 	additional_peak->next_action_time = basic_action->next_action_time;
 	additional_peak->deallocation_time = basic_action->deallocation_time;
