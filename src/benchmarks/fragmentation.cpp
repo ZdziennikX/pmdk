@@ -116,8 +116,9 @@ struct frag_bench
 	uint64_t n_ops;
 	size_t poolsize;
 	size_t theoretical_memory_usage;
-	struct frag_obj **pmemobj_array; /*array of pmemobj objects used in benchmark*/
-	int(*func_op)(frag_obj * op_obj, frag_bench * fb, struct frag_worker * fworker, operation_info *info);//info to delete
+	struct frag_obj **pmemobj_array; /*array of objects used in benchmark*/
+	int(*func_op)(frag_obj * op_obj, frag_bench * fb,
+		struct frag_worker * fworker);
 
 	/*
 	* free all allocated pmemobj objects used in benchmark
@@ -145,7 +146,8 @@ struct action_obj {
 	unsigned deallocation_time = 0; /*time after object should be deallocated*/
 	unsigned next_action_time = 0; /*time of next action execution*/
 	/*function used in action execution*/
-	int(*action_op)(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker) = nullptr;
+	int(*action_op)(frag_obj * op_obj, frag_bench * fb,
+		struct frag_worker * worker) = nullptr;
 };
 
 /*
@@ -164,11 +166,13 @@ struct frag_worker {
 */
 struct scenario {
 	const char *scenario_name;
-	int(*func_op)(frag_obj * op_obj, frag_bench * fb, struct frag_worker * fworker, operation_info *info);
+	int(*func_op)(frag_obj * op_obj, frag_bench * fb,
+		struct frag_worker * fworker);
 };
 
 /*
- * parse_memory_usage_type -- parse command line "--background-memory-usage" argument
+ * parse_memory_usage_type -- parse command line "--background-memory-usage"
+ * argument
  *
  * Returns proper memory usage type.
  */
@@ -227,7 +231,8 @@ dealloc_obj(frag_obj * op_obj, int n_ops, size_t *mem_usage)
 * Returns is allocation succeed.
 */
 static int
-alloc_obj_if_not_allocated(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker)
+alloc_obj_if_not_allocated(frag_obj * op_obj, frag_bench * fb,
+	struct frag_worker * worker)
 {
 	if (!op_obj->is_allocated)
 	{
@@ -278,7 +283,8 @@ dealloc_peak(frag_bench *fb, PMEMoid *oids)
 * Returns is allocation succeed.
 */
 static int
-alloc_greater_obj(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker)
+alloc_greater_obj(frag_obj * op_obj, frag_bench * fb,
+	struct frag_worker * worker)
 {
 	if(op_obj->is_allocated)
 		dealloc_obj(op_obj, fb->n_ops, &fb->theoretical_memory_usage);
@@ -332,8 +338,9 @@ peak_action(frag_bench * fb, action_obj * action, int current_time)
 * Returns is action succeed.
 */
 static int
-background_operation(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker,
-	action_obj * action, mem_usage_type mem_usage_type = MEM_USAGE_UNKNOWN)
+background_operation(frag_obj * op_obj, frag_bench * fb,
+	struct frag_worker * worker, action_obj * action,
+	mem_usage_type mem_usage_type = MEM_USAGE_UNKNOWN)
 {
 	unsigned current_time = worker->current_test_time;
 	if (current_time == action->next_action_time ||
@@ -358,7 +365,8 @@ background_operation(frag_obj * op_obj, frag_bench * fb, struct frag_worker * wo
 
 				if (fb->pa->rand)
 				{
-					next_action = os_rand_r(&fb->pa->seed) % fb->pa->growth_interval + 1;
+					next_action = os_rand_r(&fb->pa->seed) %
+						fb->pa->growth_interval + 1;
 				}
 
 				action->next_action_time = current_time + next_action;
@@ -390,10 +398,12 @@ background_operation(frag_obj * op_obj, frag_bench * fb, struct frag_worker * wo
 * Returns is action is proper initialized.
 */
 static int
-init_basic_action(frag_bench * fb, struct frag_worker * worker, action_obj * action, mem_usage_type mem_usage_type)
+init_basic_action(frag_bench * fb, struct frag_worker * worker,
+	action_obj * action, mem_usage_type mem_usage_type)
 {
 	action->deallocation_time = fb->pa->operation_time -
-		(os_rand_r(&fb->pa->seed) % fb->pa->operation_time) * fb->pa->rand;
+		(os_rand_r(&fb->pa->seed) % fb->pa->operation_time) *
+		fb->pa->rand;
 
 	switch (mem_usage_type)
 	{
@@ -407,14 +417,16 @@ init_basic_action(frag_bench * fb, struct frag_worker * worker, action_obj * act
 		action->allocation_start_time = 0;
 		action->next_action_time = worker->current_test_time +
 			fb->pa->growth_interval -
-			(os_rand_r(&fb->pa->seed) % fb->pa->growth_interval) * fb->pa->rand;
+			(os_rand_r(&fb->pa->seed) % fb->pa->growth_interval) *
+			fb->pa->rand;
 		break;
 	case MEM_USAGE_PEAK:
 		action->action_op = alloc_obj_if_not_allocated;
 		action->allocation_start_time = 0;
 		action->next_action_time = worker->current_test_time +
 			fb->pa->peak_lifetime -
-			(os_rand_r(&fb->pa->seed) % fb->pa->peak_lifetime) * fb->pa->rand;
+			(os_rand_r(&fb->pa->seed) % fb->pa->peak_lifetime) *
+			fb->pa->rand;
 		break;
 	default:
 		return -1;
@@ -429,7 +441,7 @@ init_basic_action(frag_bench * fb, struct frag_worker * worker, action_obj * act
 * Returns is scenario execution succeed.
 */
 static int
-basic(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, operation_info *info)//info to delete
+basic(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker)
 {
 	auto *action = (struct action_obj *)malloc(sizeof(struct action_obj));
 
@@ -460,16 +472,18 @@ err:
 * Returns is scenario execution succeed.
 */
 static int
-add_peaks(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, operation_info *info)//info to delete
+add_peaks(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker)
 {
-	auto *basic_action = (struct action_obj *)malloc(sizeof(struct action_obj));
+	auto *basic_action =
+		(struct action_obj *)malloc(sizeof(struct action_obj));
 	if (basic_action == nullptr)
 	{
 		perror("malloc");
 		return -1;
 	}
 
-	auto *additional_peak = (struct action_obj *)malloc(sizeof(struct action_obj));
+	auto *additional_peak =
+		(struct action_obj *)malloc(sizeof(struct action_obj));
 	if (additional_peak == nullptr)
 	{
 		free(basic_action);
@@ -497,7 +511,8 @@ add_peaks(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, opera
 		{
 			peak_action(fb, additional_peak, worker->current_test_time);
 			if (!additional_peak->peak_allocated)
-				additional_peak->next_action_time = basic_action->next_action_time;
+				additional_peak->next_action_time =
+				basic_action->next_action_time;
 		}
 		worker->current_test_time++;
 		usleep(1);
@@ -512,28 +527,32 @@ err:
 }
 
 /*
-* add_peaks -- scenario with basic scenario as background and additional growing
-* objects allocations
+* add_peaks -- scenario with basic scenario as background and additional
+* growing objects allocations
 *
 * Returns is scenario execution succeed.
 */
 static int
-basic_and_growth(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, operation_info *info)//info to delete
+basic_and_growth(frag_obj * op_obj, frag_bench * fb,
+	struct frag_worker * worker)
 {
-	auto *basic_action = (struct action_obj *)malloc(sizeof(struct action_obj));
+	auto *basic_action = (struct action_obj *)
+		malloc(sizeof(struct action_obj));
 	if (basic_action == nullptr)
 	{
 		perror("malloc");
 		return -1;
 	}
-	auto *additional_growth = (struct action_obj *)malloc(sizeof(struct action_obj));
+	auto *additional_growth = (struct action_obj *)
+		malloc(sizeof(struct action_obj));
 	if (basic_action == nullptr)
 	{
 		free(basic_action);
 		perror("malloc");
 		return -1;
 	}
-	auto * growth_obj = (struct frag_obj*)malloc(sizeof(struct frag_obj));
+	auto * growth_obj = (struct frag_obj*)
+		malloc(sizeof(struct frag_obj));
 	if (growth_obj == nullptr)
 	{
 		perror("malloc");
@@ -556,7 +575,8 @@ basic_and_growth(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker
 		if (background_operation(op_obj, fb, worker, basic_action))
 			goto err;
 
-		if (background_operation(growth_obj, fb, worker, additional_growth, MEM_USAGE_RAMP))
+		if (background_operation(growth_obj, fb, worker, additional_growth,
+			MEM_USAGE_RAMP))
 			goto err;
 
 		worker->current_test_time++;
@@ -611,7 +631,7 @@ frag_operation(struct benchmark *bench, struct operation_info *info)
 	op_pmemobj->op_index = fworker->op_obj_off + info->index;
 	fworker->current_test_time = 0;
 
-	return fb->func_op(op_pmemobj, fb, fworker, info);
+	return fb->func_op(op_pmemobj, fb, fworker);
 }
 
 /*
@@ -687,7 +707,8 @@ frag_init(struct benchmark *bench, struct benchmark_args *args)
 
 	///* For data objects */
 	size_t n_objs = args->n_ops_per_thread * args->n_threads;
-	fb->poolsize = n_objs * (fb->pa->max_obj_size * fb->pa->peak_multiplier + OOB_HEADER_SIZE);
+	fb->poolsize = n_objs * (fb->pa->max_obj_size * fb->pa->peak_multiplier
+		+ OOB_HEADER_SIZE);
 
 	///* multiply by FACTOR for metadata, fragmentation, etc. */
 	fb->poolsize = fb->poolsize * FACTOR;
@@ -711,7 +732,8 @@ frag_init(struct benchmark *bench, struct benchmark_args *args)
 		goto free_fb;
 	}
 	
-	fb->pmemobj_array = (struct frag_obj **)malloc(sizeof(struct frag_obj*) * n_objs);
+	fb->pmemobj_array = (struct frag_obj **)malloc(sizeof(struct frag_obj*) *
+		n_objs);
 	if (fb->pmemobj_array == nullptr)
 	{
 		perror("malloc");
@@ -719,7 +741,8 @@ frag_init(struct benchmark *bench, struct benchmark_args *args)
 	}
 	for (unsigned i = 0; i < n_objs; ++i)
 	{
-		fb->pmemobj_array[i]= (struct frag_obj *)malloc(sizeof(struct frag_obj));
+		fb->pmemobj_array[i]= (struct frag_obj *)
+			malloc(sizeof(struct frag_obj));
 
 		if (fb->pmemobj_array[i] == nullptr)
 		{
@@ -730,7 +753,8 @@ frag_init(struct benchmark *bench, struct benchmark_args *args)
 		fb->pmemobj_array[i]->init(fb->pa);
 	}
 
-	fb->background_mem_usage = parse_memory_usage_type(fb->pa->background_mem_usage_type_str);
+	fb->background_mem_usage =
+		parse_memory_usage_type(fb->pa->background_mem_usage_type_str);
 	scenario_index = parse_scenario(fb->pa->scenario);
 	if (scenario_index == -1) {
 		perror("wrong scenario name");
@@ -797,7 +821,8 @@ frag_print_fragmentation(struct benchmark *bench,
 	struct benchmark_args *args,
 	struct total_results *res)
 {
-	printf(";fragmentation:%f;%f;%f", fragmentation, fragmentation2,fragmentation3);
+	printf(";fragmentation:%f;%f;%f", fragmentation, fragmentation2,
+		fragmentation3);
 }
 
 static struct benchmark_clo frag_clo[12];
@@ -820,7 +845,8 @@ frag_constructor(void)
 	frag_clo[1].type = CLO_TYPE_UINT;
 	frag_clo[1].off = clo_field_offset(struct prog_args, start_obj_size);
 	frag_clo[1].def = "64";
-	frag_clo[1].type_uint.size = clo_field_size(struct prog_args, start_obj_size);
+	frag_clo[1].type_uint.size =
+		clo_field_size(struct prog_args, start_obj_size);
 	frag_clo[1].type_uint.base = CLO_INT_BASE_DEC;
 	frag_clo[1].type_uint.min = 0;
 	frag_clo[1].type_uint.max = ~0;
@@ -830,7 +856,8 @@ frag_constructor(void)
 	frag_clo[2].type = CLO_TYPE_UINT;
 	frag_clo[2].off = clo_field_offset(struct prog_args, max_obj_size);
 	frag_clo[2].def = "1024";
-	frag_clo[2].type_uint.size = clo_field_size(struct prog_args, max_obj_size);
+	frag_clo[2].type_uint.size =
+		clo_field_size(struct prog_args, max_obj_size);
 	frag_clo[2].type_uint.base = CLO_INT_BASE_DEC;
 	frag_clo[2].type_uint.min = 0;
 	frag_clo[2].type_uint.max = ~0;
@@ -840,7 +867,8 @@ frag_constructor(void)
 	frag_clo[3].type = CLO_TYPE_UINT;
 	frag_clo[3].off = clo_field_offset(struct prog_args, operation_time);
 	frag_clo[3].def = "1000";
-	frag_clo[3].type_uint.size = clo_field_size(struct prog_args, operation_time);
+	frag_clo[3].type_uint.size =
+		clo_field_size(struct prog_args, operation_time);
 	frag_clo[3].type_uint.base = CLO_INT_BASE_DEC;
 	frag_clo[3].type_uint.min = 0;
 	frag_clo[3].type_uint.max = ~0;
@@ -850,7 +878,8 @@ frag_constructor(void)
 	frag_clo[4].type = CLO_TYPE_UINT;
 	frag_clo[4].off = clo_field_offset(struct prog_args, peak_lifetime);
 	frag_clo[4].def = "10";
-	frag_clo[4].type_uint.size = clo_field_size(struct prog_args, peak_lifetime);
+	frag_clo[4].type_uint.size =
+		clo_field_size(struct prog_args, peak_lifetime);
 	frag_clo[4].type_uint.base = CLO_INT_BASE_DEC;
 	frag_clo[4].type_uint.min = 0;
 	frag_clo[4].type_uint.max = ~0;
@@ -860,7 +889,8 @@ frag_constructor(void)
 	frag_clo[5].type = CLO_TYPE_UINT;
 	frag_clo[5].off = clo_field_offset(struct prog_args, growth_factor);
 	frag_clo[5].def = "8";
-	frag_clo[5].type_uint.size = clo_field_size(struct prog_args, growth_factor);
+	frag_clo[5].type_uint.size =
+		clo_field_size(struct prog_args, growth_factor);
 	frag_clo[5].type_uint.base = CLO_INT_BASE_DEC;
 	frag_clo[5].type_uint.min = 0;
 	frag_clo[5].type_uint.max = ~0;
@@ -870,7 +900,8 @@ frag_constructor(void)
 	frag_clo[6].type = CLO_TYPE_UINT;
 	frag_clo[6].off = clo_field_offset(struct prog_args, peak_multiplier);
 	frag_clo[6].def = "10";
-	frag_clo[6].type_uint.size = clo_field_size(struct prog_args, peak_multiplier);
+	frag_clo[6].type_uint.size =
+		clo_field_size(struct prog_args, peak_multiplier);
 	frag_clo[6].type_uint.base = CLO_INT_BASE_DEC;
 	frag_clo[6].type_uint.min = 0;
 	frag_clo[6].type_uint.max = ~0;
@@ -880,7 +911,8 @@ frag_constructor(void)
 	frag_clo[7].type = CLO_TYPE_UINT;
 	frag_clo[7].off = clo_field_offset(struct prog_args, peak_allocs);
 	frag_clo[7].def = "100";
-	frag_clo[7].type_uint.size = clo_field_size(struct prog_args, peak_allocs);
+	frag_clo[7].type_uint.size =
+		clo_field_size(struct prog_args, peak_allocs);
 	frag_clo[7].type_uint.base = CLO_INT_BASE_DEC;
 	frag_clo[7].type_uint.min = 0;
 	frag_clo[7].type_uint.max = ~0;
@@ -913,7 +945,8 @@ frag_constructor(void)
 	frag_clo[11].type = CLO_TYPE_UINT;
 	frag_clo[11].off = clo_field_offset(struct prog_args, growth_interval);
 	frag_clo[11].def = "100";
-	frag_clo[11].type_uint.size = clo_field_size(struct prog_args, growth_interval);
+	frag_clo[11].type_uint.size =
+		clo_field_size(struct prog_args, growth_interval);
 	frag_clo[11].type_uint.base = CLO_INT_BASE_DEC;
 	frag_clo[11].type_uint.min = 0;
 	frag_clo[11].type_uint.max = ~0;
