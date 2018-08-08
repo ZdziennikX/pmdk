@@ -88,7 +88,6 @@ struct prog_args {
 	unsigned peak_allocs; /*number of peak allocations*/
 	unsigned seed; /* seed for randomization */
 	bool rand; /* use random numbers */
-
 };
 
 struct frag_obj
