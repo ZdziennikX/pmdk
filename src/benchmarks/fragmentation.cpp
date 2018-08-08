@@ -70,6 +70,7 @@ enum mem_usage_type {
 
 static float fragmentation = 0;
 static float fragmentation2 = 0;
+static float fragmentation3 = 0;
 
 /*
  * prog_args -- benchmark specific arguments
@@ -77,14 +78,14 @@ static float fragmentation2 = 0;
 struct prog_args {
 	char *background_mem_usage_type_str; /* mem_usage_type: flat, peak, ramp */
 	char *scenario; /*test scenario name*/
-	size_t start_obj_size;
-	size_t max_obj_size;
-	size_t growth_factor;
-	size_t growth_interval;
-	size_t peak_multiplier;
-	unsigned operation_time;
-	unsigned peak_lifetime;
-	unsigned peak_allocs;
+	size_t start_obj_size; /*initial object size*/
+	size_t max_obj_size; /*maximal object size*/
+	size_t growth_factor; /*parametr how fast object will grow in ramp mode*/
+	size_t growth_interval; /*time after objects will grow in ramp mode*/
+	size_t peak_multiplier; /*multipier of poolsize for peak allocations*/
+	unsigned operation_time; /*maximal operation time*/
+	unsigned peak_lifetime; /*lifetime of peak allocations*/
+	unsigned peak_allocs; /*number of peak allocations*/
 	unsigned seed; /* seed for randomization */
 	bool rand; /* use random numbers */
 
@@ -92,21 +93,22 @@ struct prog_args {
 
 struct frag_obj
 {
-	unsigned block_lifetime;
-	size_t block_size;
+	size_t block_size; /*size of pmemobj*/
 	PMEMoid oid;
 	bool is_allocated;
 	int op_index;
 
 	void init(struct prog_args *args)
 	{
-		block_lifetime = args->operation_time;
 		block_size = args->start_obj_size;
 		is_allocated = false;
 		op_index = -1;
 	}
 };
 
+/*
+* frag_bench -- fragmentation benchmark context
+*/
 struct frag_bench
 {
 	PMEMobjpool *pop; /* persistent pool handle */
@@ -115,9 +117,12 @@ struct frag_bench
 	uint64_t n_ops;
 	size_t poolsize;
 	size_t theoretical_memory_usage;
-	struct frag_obj **pmemobj_array;
+	struct frag_obj **pmemobj_array; /*array of pmemobj objects used in benchmark*/
 	int(*func_op)(frag_obj * op_obj, frag_bench * fb, struct frag_worker * fworker, operation_info *info);//info to delete
 
+	/*
+	* free all allocated pmemobj objects used in benchmark
+	*/
 	void free_pmemobj_array(unsigned nb)
 	{
 		for (unsigned i = 0; i < nb && nb >= 0; i++)
@@ -130,15 +135,17 @@ struct frag_bench
 		}
 	}
 };
+
 /*
 * struct action_obj -- fragmentation benchmark action context
 */
 struct action_obj {
-	PMEMoid *peak_oids = nullptr;
+	PMEMoid *peak_oids = nullptr; /*oids array for peak allocations*/
 	bool peak_allocated = false;
-	unsigned allocation_start_time = 0;
-	unsigned deallocation_time = 0;
-	unsigned next_action_time = 0;
+	unsigned allocation_start_time = 0; /*time of first allocation*/
+	unsigned deallocation_time = 0; /*time after object should be deallocated*/
+	unsigned next_action_time = 0; /*time of next action execution*/
+	/*function used in action execution*/
 	int(*action_op)(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker) = nullptr;
 };
 
@@ -151,17 +158,18 @@ struct frag_worker {
 	size_t cur_block_size;
 	size_t growth_factor;
 	unsigned current_test_time;
-	unsigned seed;
-	bool rand;
 };
 
+/*
+* struct scenario -- scenario name and function used in frag_operation function
+*/
 struct scenario {
 	const char *scenario_name;
 	int(*func_op)(frag_obj * op_obj, frag_bench * fb, struct frag_worker * fworker, operation_info *info);
 };
 
 /*
- * parse_memory_usage_type -- parse command line "--operation" argument
+ * parse_memory_usage_type -- parse command line "--background-memory-usage" argument
  *
  * Returns proper memory usage type.
  */
@@ -178,6 +186,11 @@ parse_memory_usage_type(const char *arg)
 		return MEM_USAGE_UNKNOWN;
 }
 
+/*
+* alloc_obj -- allocate object and calculate theoretical memory usage
+*
+* Returns is allocation succeed.
+*/
 static int
 alloc_obj(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker)
 {
@@ -194,8 +207,8 @@ alloc_obj(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker)
 
 /*
 * dealloc_obj -- function deallocate memory except last operation.
-  Memory is not deallocated for purpose of fragmentation calculation
-  at the end of benchmark execution
+* Memory is not deallocated for purpose of fragmentation calculation
+* at the end of benchmark execution
 */
 static void
 dealloc_obj(frag_obj * op_obj, int n_ops, size_t *mem_usage)
@@ -208,6 +221,12 @@ dealloc_obj(frag_obj * op_obj, int n_ops, size_t *mem_usage)
 	}
 }
 
+/*
+* alloc_obj_if_not_allocated -- allocate object if it is not alloated
+* and calculate theoretical memory usage
+*
+* Returns is allocation succeed.
+*/
 static int
 alloc_obj_if_not_allocated(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker)
 {
@@ -218,6 +237,11 @@ alloc_obj_if_not_allocated(frag_obj * op_obj, frag_bench * fb, struct frag_worke
 	return 0;
 }
 
+/*
+* alloc_peak -- allocate multiple small objects to simulate peak memory usage
+*
+* Returns array of allocated objects oids.
+*/
 static PMEMoid *
 alloc_peak(frag_bench *fb)
 {
@@ -235,7 +259,10 @@ alloc_peak(frag_bench *fb)
 	return oids;
 }
 
-static int
+/*
+* dealloc_peak -- deallocate objects allocated by alloc_peak function
+*/
+static void
 dealloc_peak(frag_bench *fb, PMEMoid *oids)
 {
 	for (unsigned i = 0; i < fb->pa->peak_allocs; ++i)
@@ -244,9 +271,13 @@ dealloc_peak(frag_bench *fb, PMEMoid *oids)
 	}
 
 	free(oids);
-	return 0;
 }
 
+/*
+* alloc_greater_obj -- if needed deallocate old object and allocate bigger one
+*
+* Returns is allocation succeed.
+*/
 static int
 alloc_greater_obj(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker)
 {
@@ -262,6 +293,13 @@ alloc_greater_obj(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worke
 	}
 	return alloc_obj(op_obj, fb, worker);
 }
+
+/*
+* peak_action -- function maintain peak allocation and deallocation in
+* scenarios
+*
+* Returns is action succeed.
+*/
 static int
 peak_action(frag_bench * fb, action_obj * action, int current_time)
 {
@@ -287,6 +325,13 @@ peak_action(frag_bench * fb, action_obj * action, int current_time)
 	}
 	return 0;
 }
+
+/*
+* background_operation -- function maintain basic and/or background operation
+* in scenarios
+*
+* Returns is action succeed.
+*/
 static int
 background_operation(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker,
 	action_obj * action, mem_usage_type mem_usage_type = MEM_USAGE_UNKNOWN)
@@ -339,11 +384,18 @@ background_operation(frag_obj * op_obj, frag_bench * fb, struct frag_worker * wo
 	return 0;
 }
 
-static void
+/*
+* background_operation -- function maintain basic and/or background operation
+* in scenarios
+*
+* Returns is action is proper initialized.
+*/
+static int
 init_basic_action(frag_bench * fb, struct frag_worker * worker, action_obj * action, mem_usage_type mem_usage_type)
 {
-	if (fb->pa->rand)
-		action->deallocation_time = os_rand_r(&fb->pa->seed) % fb->pa->operation_time + 1;
+	action->deallocation_time = fb->pa->operation_time -
+		(os_rand_r(&fb->pa->seed) % fb->pa->operation_time) * fb->pa->rand;
+
 	switch (mem_usage_type)
 	{
 	case MEM_USAGE_FLAT:
@@ -366,19 +418,27 @@ init_basic_action(frag_bench * fb, struct frag_worker * worker, action_obj * act
 			(os_rand_r(&fb->pa->seed) % fb->pa->peak_lifetime) * fb->pa->rand;
 		break;
 	default:
+		return -1;
 		break;
 	}
+	return 0;
 }
 
+/*
+* basic -- simplest scenario
+*
+* Returns is scenario execution succeed.
+*/
 static int
 basic(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, operation_info *info)//info to delete
 {
 	auto *action = (struct action_obj *)malloc(sizeof(struct action_obj));
 
-	init_basic_action(fb, worker, action, fb->background_mem_usage);
+	if (init_basic_action(fb, worker, action, fb->background_mem_usage))
+		goto err;
 
 	if (action->action_op(op_obj, fb, worker))
-		goto err ;
+		goto err;
 
 	while (worker->current_test_time<fb->pa->operation_time)
 	{
@@ -394,6 +454,12 @@ err:
 	return -1;
 }
 
+/*
+* add_peaks -- scenario with basic scenario as background and additional peak
+* memory usage
+*
+* Returns is scenario execution succeed.
+*/
 static int
 add_peaks(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, operation_info *info)//info to delete
 {
@@ -411,7 +477,8 @@ add_peaks(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, opera
 		return -1;
 	}
 
-	init_basic_action(fb, worker, basic_action, fb->background_mem_usage);
+	if (init_basic_action(fb, worker, basic_action, fb->background_mem_usage))
+		goto err;
 	additional_peak->allocation_start_time = basic_action->next_action_time;
 	additional_peak->next_action_time = basic_action->next_action_time;
 	additional_peak->deallocation_time = basic_action->deallocation_time;
@@ -443,6 +510,12 @@ err:
 	return -1;
 }
 
+/*
+* add_peaks -- scenario with basic scenario as background and additional growing
+* objects allocations
+*
+* Returns is scenario execution succeed.
+*/
 static int
 basic_and_growth(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker, operation_info *info)//info to delete
 {
@@ -467,8 +540,10 @@ basic_and_growth(frag_obj * op_obj, frag_bench * fb, struct frag_worker * worker
 	}
 	growth_obj->init(fb->pa);
 
-	init_basic_action(fb, worker, basic_action, fb->background_mem_usage);
-	init_basic_action(fb, worker, additional_growth, MEM_USAGE_RAMP);
+	if (init_basic_action(fb, worker, basic_action, fb->background_mem_usage))
+		goto err;
+	if (init_basic_action(fb, worker, additional_growth, MEM_USAGE_RAMP))
+		goto err;
 
 	if (basic_action->action_op(op_obj, fb, worker))
 		goto err;
@@ -497,6 +572,7 @@ err:
 	free(basic_action);
 	return -1;
 }
+
 static struct scenario scenarios[] = {
 	{ "basic", basic },
 	{ "basic_with_peaks", add_peaks },
@@ -505,6 +581,11 @@ static struct scenario scenarios[] = {
 
 #define SCENARIOS (sizeof(scenarios) / sizeof(scenarios[0]))
 
+/*
+* parse_scenario -- parse command line "--scenario" argument
+*
+* Returns proper scenario name.
+*/
 static int
 parse_scenario(const char *arg)
 {
@@ -699,19 +780,23 @@ frag_exit(struct benchmark *bench, struct benchmark_args *args)
 
 	fragmentation = ((float)used / fb->theoretical_memory_usage) - 1.f;
 	fragmentation2 = ((float)used / allocated_sum) - 1.f;
-	float fragmentation3 = ((float)used / allocated_sum2) - 1.f;
+	fragmentation3 = ((float)used / allocated_sum2) - 1.f;
 
 	fb->free_pmemobj_array(n_ops);
 	pmemobj_close(fb->pop);
 	free(fb);
 	return 0;
 }
+
+/*
+* frag_print_fragmentation -- function to print additional information
+*/
 static void
 frag_print_fragmentation(struct benchmark *bench,
 	struct benchmark_args *args,
 	struct total_results *res)
 {
-	printf(";%f;%f", fragmentation,fragmentation2);
+	printf(";fragmentation:%f;%f;%f", fragmentation, fragmentation2,fragmentation3);
 }
 
 static struct benchmark_clo frag_clo[12];
